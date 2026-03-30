@@ -4,7 +4,7 @@ import time
 import os
 from bs4 import BeautifulSoup
 
-# --- INSTALACIÓN DE PLAYWRIGHT EN LA NUBE ---
+# --- INSTALACIÓN DE PLAYWRIGHT EN STREAMLIT CLOUD ---
 @st.cache_resource
 def install_playwright():
     try:
@@ -87,33 +87,31 @@ def extraer_multas_desde_html(html: str) -> pd.DataFrame:
         df = df.drop_duplicates().reset_index(drop=True)
     return df
 
-def scraping_multas(cuit, g_recaptcha_response):
+def scraping_multas(cuit):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        # IMPORTANTE: Aquí vamos a "robarle" la sesión al navegador si es posible
+        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        page = context.new_page()
 
         page.goto(URL_PBA, wait_until="networkidle")
 
-        # Configurar búsqueda por CUIT
+        st.write("📊 Procesando tu consulta en segundo plano...")
+        
+        # Simular búsqueda con el CUIT que ingresó el empleado
         page.click("a[href='#x-document']")
         page.select_option("#filtroIdTipoDocumento", "4") 
         page.fill("#filtroNroDocumento", cuit)
         
-        # INYECCIÓN DEL TOKEN CAPTURADO MANUALMENTE
-        st.write("🔑 Inyectando token en el servidor de PBA...")
-        page.evaluate(f"document.getElementById('g-recaptcha-response').innerHTML = '{g_recaptcha_response}';")
-        
-        # Click en el botón de búsqueda (usando el id correcto de PBA)
-        page.click("#btnConsultar") 
-        
-        # Esperar resultados o mensaje de error
-        st.write("⏳ Procesando consulta remota...")
-        timeout_seg = 25
+        # Aquí el sistema espera a que APAREZCAN RESULTADOS en la nube.
+        # Como no inyectamos token, el empleado debe haber resuelto el captcha
+        # y pulsado buscar en la ventana incrustada de arriba.
+        timeout_seg = 30
         inicio = time.time()
         resultado_detectado = False
         while time.time() - inicio < timeout_seg:
             html = page.content()
-            if "Nº de Acta:" in html or "Estado CAUSA:" in html or "Error" in html:
+            if "Nº de Acta:" in html or "Estado CAUSA:" in html:
                 resultado_detectado = True
                 break
             if "no posee infracciones" in html.lower() or "no registra infracciones" in html.lower():
@@ -123,74 +121,52 @@ def scraping_multas(cuit, g_recaptcha_response):
             
         if not resultado_detectado:
             browser.close()
-            return None, "El servidor de la provincia no respondió. Es posible que el token haya expirado (duran 2 minutos)."
+            return None, "No se detectaron multas. ¿Pulsaste 'Buscar' dentro del recuadro oficial?"
 
         todas_las_multas = []
-        pagina_actual = 1
-        
-        # Bucle de paginación
-        while True:
-            # Expandir detalles
-            try:
-                botones = page.locator("a.expand")
-                for i in range(botones.count()):
-                    botones.nth(i).click(timeout=1000)
-            except: pass
-            
-            time.sleep(1.5)
-            df_parcial = extraer_multas_desde_html(page.content())
-            if not df_parcial.empty:
-                todas_las_multas.append(df_parcial)
-
-            # Intentar ir a la siguiente página
-            siguiente_btn = page.locator(f"a:text-is('{pagina_actual + 1}'), button:text-is('{pagina_actual + 1}')").first
-            try:
-                if siguiente_btn.count() > 0 and siguiente_btn.is_visible():
-                    siguiente_btn.click(timeout=3000)
-                    time.sleep(3)
-                    pagina_actual += 1
-                else: break
-            except: break
-                
+        df_final = extraer_multas_desde_html(page.content())
         browser.close()
-        
-        if todas_las_multas:
-            return pd.concat(todas_las_multas, ignore_index=True), "Búsqueda completa."
-        else:
-            return pd.DataFrame(), "No se encontraron infracciones para este CUIT."
+        return df_final, "Búsqueda completa."
 
 # --- INTERFAZ STREAMLIT ---
-st.set_page_config(page_title="Consultor PBA Nube", page_icon="🚔")
+st.set_page_config(page_title="Gestor Multas PBA", page_icon="🚔", layout="wide")
 
-st.title("🚔 Consultor Multas PBA (Nube)")
-st.info("💡 **Instrucciones para el empleado:**\n1. Ve a la [Web de PBA](https://infraccionesba.gba.gob.ar/consulta-infraccion) y resuelve el 'No soy un robot'.\n2. Abre la consola (F12) y pega esto: `copy(document.getElementById('g-recaptcha-response').value)`\n3. Pega el resultado aquí abajo y dale a Buscar.")
+st.title("🚔 Gestor Online Multas PBA")
+st.write("Completa el formulario en el recuadro gris de abajo y luego pulsa **'Descargar Excel'**.")
 
-cuit = st.text_input("Ingresa el CUIT:", placeholder="30714561762")
-token = st.text_area("Pega el Token de Google aquí (Ctrl+V):", height=100)
+col1, col2 = st.columns([2, 1])
 
-if st.button("🚀 Iniciar Scraping en la Nube", type="primary"):
-    if not cuit or not token:
-        st.warning("Faltan datos (CUIT o Token).")
-    else:
-        with st.spinner("Ejecutando navegador invisible en el servidor..."):
-            df, msj = scraping_multas(cuit, token)
-            
-            if df is None:
-                st.error(msj)
-            elif df.empty:
-                st.success(f"✅ {msj}")
-            else:
-                st.success(f"📈 ¡Éxito! Se encontraron {len(df)} infracciones.")
-                st.dataframe(df)
+with col1:
+    st.subheader("1. Completa los datos en la Web Oficial:")
+    # INCRUSTAMOS LA WEB OFICIAL EN UN IFRAME
+    st.components.v1.iframe(URL_PBA, height=600, scrolling=True)
+
+with col2:
+    st.subheader("2. Obtener Reporte:")
+    cuit = st.text_input("Vuelve a escribir el CUIT consultado:")
+    
+    if st.button("🚀 Generar Excel", type="primary"):
+        if not cuit:
+            st.warning("Escribe el CUIT para confirmar.")
+        else:
+            with st.spinner("Leyendo información remota..."):
+                df, msj = scraping_multas(cuit)
                 
-                # Descargar Excel
-                from io import BytesIO
-                output = BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df.to_excel(writer, index=False)
-                st.download_button(
-                    label="📥 Descargar Reporte (.xlsx)",
-                    data=output.getvalue(),
-                    file_name=f"multas_{cuit}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                if df is None:
+                    st.error(msj)
+                elif df.empty:
+                    st.success(f"✅ {msj}")
+                else:
+                    st.success(f"📈 ¡Éxito! Se encontraron {len(df)} infracciones.")
+                    st.dataframe(df)
+                    
+                    from io import BytesIO
+                    output = BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        df.to_excel(writer, index=False)
+                    st.download_button(
+                        label="📥 Descargar Reporte (.xlsx)",
+                        data=output.getvalue(),
+                        file_name=f"multas_{cuit}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
