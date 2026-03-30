@@ -2,29 +2,23 @@ import streamlit as st
 import pandas as pd
 import time
 import os
-import subprocess
 from bs4 import BeautifulSoup
 
-# --- OBLIGATORIO PARA DEPLOY EN STREAMLIT CLOUD ---
-# Streamlit Cloud necesita instalar los navegadores de Playwright la primera vez que arranca.
+# --- INSTALACIÓN DE PLAYWRIGHT EN LA NUBE ---
 @st.cache_resource
 def install_playwright():
     try:
         os.system("playwright install chromium")
-        # En Streamlit Cloud Linux a veces faltan dependencias, `install-deps` ayuda
         os.system("playwright install-deps chromium") 
     except Exception as e:
-        st.error(f"Error instalando navegadores de Playwright: {e}")
+        st.error(f"Error instalando navegadores: {e}")
 
 install_playwright()
 
 from playwright.sync_api import sync_playwright
 
 # --- CONFIGURACIÓN ---
-# DEBES CAMBIAR ESTA LLAVE POR LA QUE ENCUENTRES EN EL CÓDIGO FUENTE DE LA PÁGINA
-SITEKEY_CAPTCHA = "6LeGXnkUAAAAAGHv-jMgqrOMx4eqHCh3_fEeP9wR" 
 URL_PBA = "https://infraccionesba.gba.gob.ar/consulta-infraccion"
-
 
 def extraer_multas_desde_html(html: str) -> pd.DataFrame:
     soup = BeautifulSoup(html, "html.parser")
@@ -45,7 +39,7 @@ def extraer_multas_desde_html(html: str) -> pd.DataFrame:
         dominio = extraer(r"Dominio:\s*([A-Z0-9]+)", texto)
         generacion = extraer(r"Generaci[oó]n:\s*([0-9/]+)", texto)
         vencimiento = extraer(r"Vencimiento:\s*([0-9/]+)", texto)
-        importe = extraer(r"Importe:\s*\$\s*([0-9.,]+)", texto)
+        importe_raw = extraer(r"Importe:\s*\$\s*([0-9.,]+)", texto)
         estado_cupon = extraer(r"Estado\s+CUP[ÓO]N:\s*(.*?)(?:Estado\s+CAUSA:|Importe:)", texto)
         estado_causa = extraer(r"Estado\s+CAUSA:\s*(.*?)(?:Importe:|$)", texto)
 
@@ -83,7 +77,7 @@ def extraer_multas_desde_html(html: str) -> pd.DataFrame:
 
         rows.append({
             "Acta": acta, "Dominio": dominio, "Generación": generacion,
-            "Vencimiento": vencimiento, "Importe": importe, "Estado cupón": estado_cupon,
+            "Vencimiento": vencimiento, "Importe": importe_raw, "Estado cupón": estado_cupon,
             "Estado causa": estado_causa, "Código": codigo, "Descripción": descripcion,
             "Ubicación": ubicacion, "Radicación": radicacion,
         })
@@ -95,141 +89,108 @@ def extraer_multas_desde_html(html: str) -> pd.DataFrame:
 
 def scraping_multas(cuit, g_recaptcha_response):
     with sync_playwright() as p:
-        # IMPORTANTE: En Streamlit Cloud SIEMPRE debe ser headless=True
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
         page.goto(URL_PBA, wait_until="networkidle")
 
-        # Ir a la pestaña validación por documento
+        # Configurar búsqueda por CUIT
         page.click("a[href='#x-document']")
-        page.select_option("#filtroIdTipoDocumento", "4") # CUIT
+        page.select_option("#filtroIdTipoDocumento", "4") 
         page.fill("#filtroNroDocumento", cuit)
         
-        # ACA ESTÁ LA MAGIA: Inyectamos el token que resolvemos en Streamlit
-        # hacia el navegador invisible en la nube
-        st.write("🔑 Inyectando token en el sistema de PBA...")
+        # INYECCIÓN DEL TOKEN CAPTURADO MANUALMENTE
+        st.write("🔑 Inyectando token en el servidor de PBA...")
         page.evaluate(f"document.getElementById('g-recaptcha-response').innerHTML = '{g_recaptcha_response}';")
         
-        # Simular que pasamos el recaptcha para que habilite cosas en el front si es necesario
-        # page.evaluate(f"onSubmitCaptcha('{g_recaptcha_response}');") # A veces tienen una funcion asi
+        # Click en el botón de búsqueda (usando el id correcto de PBA)
+        page.click("#btnConsultar") 
         
-        # Click en buscar
-        page.click("#btnConsultar.hidden-xs") # o el selector del botón buscar
-        
-        # Esperar resultados
-        st.write("⏳ Esperando respuesta del gobierno (puede tardar 15s)...")
-        timeout_seg = 30
+        # Esperar resultados o mensaje de error
+        st.write("⏳ Procesando consulta remota...")
+        timeout_seg = 25
         inicio = time.time()
         resultado_detectado = False
         while time.time() - inicio < timeout_seg:
             html = page.content()
-            if "Nº de Acta:" in html or "Estado CAUSA:" in html or "No posee infracciones" in html or "no registra infracciones" in html.lower():
+            if "Nº de Acta:" in html or "Estado CAUSA:" in html or "Error" in html:
+                resultado_detectado = True
+                break
+            if "no posee infracciones" in html.lower() or "no registra infracciones" in html.lower():
                 resultado_detectado = True
                 break
             time.sleep(2)
             
         if not resultado_detectado:
             browser.close()
-            return None, "Tiempo de espera agotado. Probablemente el Captcha fue rechazado."
+            return None, "El servidor de la provincia no respondió. Es posible que el token haya expirado (duran 2 minutos)."
 
-        # Extraer todo
         todas_las_multas = []
         pagina_actual = 1
         
+        # Bucle de paginación
         while True:
-            # Expandir todo
+            # Expandir detalles
             try:
                 botones = page.locator("a.expand")
                 for i in range(botones.count()):
                     botones.nth(i).click(timeout=1000)
-            except:
-                pass
-            time.sleep(2)
+            except: pass
             
+            time.sleep(1.5)
             df_parcial = extraer_multas_desde_html(page.content())
             if not df_parcial.empty:
                 todas_las_multas.append(df_parcial)
 
-            # Siguiente pagina
+            # Intentar ir a la siguiente página
             siguiente_btn = page.locator(f"a:text-is('{pagina_actual + 1}'), button:text-is('{pagina_actual + 1}')").first
             try:
                 if siguiente_btn.count() > 0 and siguiente_btn.is_visible():
                     siguiente_btn.click(timeout=3000)
                     time.sleep(3)
                     pagina_actual += 1
-                else:
-                    break
-            except:
-                break
+                else: break
+            except: break
                 
         browser.close()
         
         if todas_las_multas:
-            return pd.concat(todas_las_multas, ignore_index=True), "Mostrando Multas"
+            return pd.concat(todas_las_multas, ignore_index=True), "Búsqueda completa."
         else:
-            return pd.DataFrame(), "No se encontraron multas."
+            return pd.DataFrame(), "No se encontraron infracciones para este CUIT."
 
-# --- INTERFAZ DE STREAMLIT ---
-st.set_page_config(page_title="Consultor PBA", page_icon="🚔", layout="centered")
+# --- INTERFAZ STREAMLIT ---
+st.set_page_config(page_title="Consultor PBA Nube", page_icon="🚔")
 
-st.title("🚔 Consultor Multas PBA en la Nube")
-st.write("Para evitar bloqueos, por favor resuelve el captcha manualmente a continuación:")
+st.title("🚔 Consultor Multas PBA (Nube)")
+st.info("💡 **Instrucciones para el empleado:**\n1. Ve a la [Web de PBA](https://infraccionesba.gba.gob.ar/consulta-infraccion) y resuelve el 'No soy un robot'.\n2. Abre la consola (F12) y pega esto: `copy(document.getElementById('g-recaptcha-response').value)`\n3. Pega el resultado aquí abajo y dale a Buscar.")
 
-cuit = st.text_input("Ingresa el CUIT de la persona/empresa:")
+cuit = st.text_input("Ingresa el CUIT:", placeholder="30714561762")
+token = st.text_area("Pega el Token de Google aquí (Ctrl+V):", height=100)
 
-# INYECTAMOS EL HTML PARA QUE SE CREE EL CAPTCHA VISUAL
-st.components.v1.html(f'''
-    <html>
-        <head>
-            <script src="https://www.google.com/recaptcha/api.js" async defer></script>
-            <script>
-                function captchaCallback(token) {{
-                    // Cuando resuelva el captcha, se lo mostramos para que lo copie
-                    document.getElementById("txd").value = token;
-                    navigator.clipboard.writeText(token); // Intenta copiarlo automaticamente
-                    document.getElementById("msg").innerHTML = "✅ ¡Resuelto! El token ha sido copiado a tu portapapeles (Ctrl+V). Opcional: cópialo de aquí abajo.";
-                }}
-            </script>
-        </head>
-        <body style="font-family: sans-serif;">
-            <div class="g-recaptcha" data-sitekey="{SITEKEY_CAPTCHA}" data-callback="captchaCallback"></div>
-            <p id="msg" style="color: green; font-weight: bold; font-size: 14px;"></p>
-            <textarea id="txd" style="width:100%; height:50px;" readonly placeholder="El token secreto aparecerá aquí..."></textarea>
-        </body>
-    </html>
-''', height=200)
-
-st.write("---")
-token = st.text_area("Pega el Token aquí (Haz clic y presiona Ctrl+V):", height=100, help="Es un texto larguísimo que demuestra que no eres un robot.")
-
-if st.button("Buscar en la Nube", type="primary"):
-    if not cuit:
-        st.warning("Debes ingresar un CUIT.")
-    elif not token or len(token) < 50:
-        st.error("Debes resolver el captcha y pegar el Token arriba.")
+if st.button("🚀 Iniciar Scraping en la Nube", type="primary"):
+    if not cuit or not token:
+        st.warning("Faltan datos (CUIT o Token).")
     else:
-        with st.spinner("Conectando servidor remoto e inyectando Token..."):
+        with st.spinner("Ejecutando navegador invisible en el servidor..."):
             df, msj = scraping_multas(cuit, token)
             
             if df is None:
                 st.error(msj)
             elif df.empty:
-                st.success("Búsqueda exitosa. La patente no registra infracciones.")
+                st.success(f"✅ {msj}")
             else:
-                st.success(f"¡Se encontraron {len(df)} infracciones!")
+                st.success(f"📈 ¡Éxito! Se encontraron {len(df)} infracciones.")
                 st.dataframe(df)
                 
-                # Botón para descargar Excel simple
+                # Descargar Excel
                 from io import BytesIO
                 output = BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df.to_excel(writer, index=False, sheet_name='Multas')
-                excel_data = output.getvalue()
-                
+                    df.to_excel(writer, index=False)
                 st.download_button(
-                    label="📥 Descargar Reporte Completo en Excel",
-                    data=excel_data,
+                    label="📥 Descargar Reporte (.xlsx)",
+                    data=output.getvalue(),
                     file_name=f"multas_{cuit}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
